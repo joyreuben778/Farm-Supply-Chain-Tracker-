@@ -313,3 +313,125 @@
   (match (map-get? AuthorizedDevices { device-id: device-id })
     device-data (ok (get active device-data))
     (ok false)))
+
+(define-map BatchExpiration
+  { batch-id: uint }
+  {
+    expiration-date: uint,
+    shelf-life-days: uint,
+    is-expired: bool,
+    recall-status: (string-ascii 20),
+    recall-reason: (string-ascii 200),
+    recall-initiated-by: (optional principal),
+    recall-date: (optional uint)
+  }
+)
+
+(define-map RecallNotifications
+  { batch-id: uint, notification-id: uint }
+  {
+    recipient: principal,
+    notification-type: (string-ascii 30),
+    message: (string-ascii 300),
+    sent-date: uint,
+    acknowledged: bool
+  }
+)
+
+(define-data-var last-notification-id uint u0)
+
+(define-constant err-batch-expired (err u400))
+(define-constant err-batch-recalled (err u401))
+(define-constant err-invalid-shelf-life (err u402))
+(define-constant err-expiration-not-set (err u403))
+
+(define-public (set-batch-expiration (batch-id uint) (shelf-life-days uint))
+  (let ((batch-details (unwrap! (map-get? BatchDetails { batch-id: batch-id }) err-not-found))
+        (expiration-date (+ (get planting-date batch-details) (* shelf-life-days u144))))
+    (asserts! (is-eq tx-sender (unwrap! (nft-get-owner? farm-batch batch-id) err-not-found)) err-owner-only)
+    (asserts! (> shelf-life-days u0) err-invalid-shelf-life)
+    (map-set BatchExpiration
+      { batch-id: batch-id }
+      {
+        expiration-date: expiration-date,
+        shelf-life-days: shelf-life-days,
+        is-expired: (>= stacks-block-height expiration-date),
+        recall-status: "none",
+        recall-reason: "",
+        recall-initiated-by: none,
+        recall-date: none
+      }
+    )
+    (ok true)))
+
+(define-public (initiate-recall (batch-id uint) (reason (string-ascii 200)))
+  (let ((expiration-info (unwrap! (map-get? BatchExpiration { batch-id: batch-id }) err-expiration-not-set)))
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (map-set BatchExpiration
+      { batch-id: batch-id }
+      (merge expiration-info
+        {
+          recall-status: "recalled",
+          recall-reason: reason,
+          recall-initiated-by: (some tx-sender),
+          recall-date: (some stacks-block-height)
+        }
+      )
+    )
+    (ok true)))
+
+(define-public (send-recall-notification (batch-id uint)
+                                       (recipient principal)
+                                       (notification-type (string-ascii 30))
+                                       (message (string-ascii 300)))
+  (let ((new-notification-id (+ (var-get last-notification-id) u1)))
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (is-some (map-get? BatchExpiration { batch-id: batch-id })) err-expiration-not-set)
+    (map-set RecallNotifications
+      { batch-id: batch-id, notification-id: new-notification-id }
+      {
+        recipient: recipient,
+        notification-type: notification-type,
+        message: message,
+        sent-date: stacks-block-height,
+        acknowledged: false
+      }
+    )
+    (var-set last-notification-id new-notification-id)
+    (ok new-notification-id)))
+
+(define-public (acknowledge-notification (batch-id uint) (notification-id uint))
+  (let ((notification (unwrap! (map-get? RecallNotifications { batch-id: batch-id, notification-id: notification-id }) err-not-found)))
+    (asserts! (is-eq tx-sender (get recipient notification)) err-owner-only)
+    (map-set RecallNotifications
+      { batch-id: batch-id, notification-id: notification-id }
+      (merge notification { acknowledged: true })
+    )
+    (ok true)))
+
+(define-read-only (check-batch-status (batch-id uint))
+  (match (map-get? BatchExpiration { batch-id: batch-id })
+    expiration-data
+    (let ((current-expired (>= stacks-block-height (get expiration-date expiration-data))))
+      (ok {
+        batch-id: batch-id,
+        is-expired: current-expired,
+        expiration-date: (get expiration-date expiration-data),
+        recall-status: (get recall-status expiration-data),
+        days-until-expiry: (if current-expired u0 (- (get expiration-date expiration-data) stacks-block-height))
+      }))
+    err-expiration-not-set))
+
+(define-read-only (get-batch-expiration (batch-id uint))
+  (ok (map-get? BatchExpiration { batch-id: batch-id })))
+
+(define-read-only (get-recall-notification (batch-id uint) (notification-id uint))
+  (ok (map-get? RecallNotifications { batch-id: batch-id, notification-id: notification-id })))
+
+(define-read-only (is-batch-safe-for-transfer (batch-id uint))
+  (match (map-get? BatchExpiration { batch-id: batch-id })
+    expiration-data
+    (let ((is-expired (>= stacks-block-height (get expiration-date expiration-data)))
+          (is-recalled (is-eq (get recall-status expiration-data) "recalled")))
+      (ok (and (not is-expired) (not is-recalled))))
+    (ok true)))
