@@ -435,3 +435,116 @@
           (is-recalled (is-eq (get recall-status expiration-data) "recalled")))
       (ok (and (not is-expired) (not is-recalled))))
     (ok true)))
+
+(define-map BatchCertifications
+  { batch-id: uint, certification-id: uint }
+  {
+    certification-type: (string-ascii 30),
+    certifier: principal,
+    issue-date: uint,
+    expiry-date: uint,
+    certificate-number: (string-ascii 50),
+    is-valid: bool,
+    verification-notes: (string-ascii 200)
+  }
+)
+
+(define-map AuthorizedCertifiers
+  { certifier: principal }
+  {
+    organization-name: (string-ascii 100),
+    accreditation-body: (string-ascii 50),
+    authorized-date: uint,
+    active: bool,
+    certification-types: (list 10 (string-ascii 30))
+  }
+)
+
+(define-data-var last-certification-id uint u0)
+
+(define-constant err-certifier-not-authorized (err u500))
+(define-constant err-certification-type-not-allowed (err u501))
+(define-constant err-certificate-expired (err u502))
+(define-constant err-certificate-not-found (err u503))
+
+(define-public (authorize-certifier (certifier principal)
+                                  (organization-name (string-ascii 100))
+                                  (accreditation-body (string-ascii 50))
+                                  (certification-types (list 10 (string-ascii 30))))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (map-set AuthorizedCertifiers
+      { certifier: certifier }
+      {
+        organization-name: organization-name,
+        accreditation-body: accreditation-body,
+        authorized-date: stacks-block-height,
+        active: true,
+        certification-types: certification-types
+      }
+    )
+    (ok true)))
+
+(define-public (issue-certificate (batch-id uint)
+                                (certification-type (string-ascii 30))
+                                (expiry-date uint)
+                                (certificate-number (string-ascii 50))
+                                (verification-notes (string-ascii 200)))
+  (let ((new-certification-id (+ (var-get last-certification-id) u1))
+        (certifier-info (unwrap! (map-get? AuthorizedCertifiers { certifier: tx-sender }) err-certifier-not-authorized)))
+    (asserts! (get active certifier-info) err-certifier-not-authorized)
+    (asserts! (is-some (index-of (get certification-types certifier-info) certification-type)) err-certification-type-not-allowed)
+    (asserts! (is-some (map-get? BatchDetails { batch-id: batch-id })) err-batch-not-found)
+    (asserts! (> expiry-date stacks-block-height) err-certificate-expired)
+    (map-set BatchCertifications
+      { batch-id: batch-id, certification-id: new-certification-id }
+      {
+        certification-type: certification-type,
+        certifier: tx-sender,
+        issue-date: stacks-block-height,
+        expiry-date: expiry-date,
+        certificate-number: certificate-number,
+        is-valid: true,
+        verification-notes: verification-notes
+      }
+    )
+    (var-set last-certification-id new-certification-id)
+    (ok new-certification-id)))
+
+(define-public (revoke-certificate (batch-id uint) (certification-id uint))
+  (let ((certificate (unwrap! (map-get? BatchCertifications { batch-id: batch-id, certification-id: certification-id }) err-certificate-not-found)))
+    (asserts! (or (is-eq tx-sender contract-owner) (is-eq tx-sender (get certifier certificate))) err-owner-only)
+    (map-set BatchCertifications
+      { batch-id: batch-id, certification-id: certification-id }
+      (merge certificate { is-valid: false })
+    )
+    (ok true)))
+
+(define-public (deactivate-certifier (certifier principal))
+  (let ((certifier-info (unwrap! (map-get? AuthorizedCertifiers { certifier: certifier }) err-not-found)))
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (map-set AuthorizedCertifiers
+      { certifier: certifier }
+      (merge certifier-info { active: false })
+    )
+    (ok true)))
+
+(define-read-only (get-certificate (batch-id uint) (certification-id uint))
+  (ok (map-get? BatchCertifications { batch-id: batch-id, certification-id: certification-id })))
+
+(define-read-only (get-certifier-info (certifier principal))
+  (ok (map-get? AuthorizedCertifiers { certifier: certifier })))
+
+(define-read-only (is-certificate-valid (batch-id uint) (certification-id uint))
+  (match (map-get? BatchCertifications { batch-id: batch-id, certification-id: certification-id })
+    certificate-data
+    (ok (and (get is-valid certificate-data) (< stacks-block-height (get expiry-date certificate-data))))
+    (ok false)))
+
+(define-read-only (get-batch-certifications-count (batch-id uint))
+  (ok (var-get last-certification-id)))
+
+(define-read-only (is-authorized-certifier (certifier principal))
+  (match (map-get? AuthorizedCertifiers { certifier: certifier })
+    certifier-data (ok (get active certifier-data))
+    (ok false)))
