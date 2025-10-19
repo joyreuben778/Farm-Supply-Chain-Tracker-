@@ -436,6 +436,197 @@
       (ok (and (not is-expired) (not is-recalled))))
     (ok true)))
 
+(define-map CarbonFootprint
+  { batch-id: uint }
+  {
+    total-emissions: uint,
+    transportation-co2: uint,
+    energy-usage-co2: uint,
+    water-usage-liters: uint,
+    fertilizer-co2: uint,
+    sustainability-score: uint,
+    carbon-neutral: bool,
+    last-updated: uint,
+    calculated-by: principal
+  }
+)
+
+(define-map CarbonEvents
+  { batch-id: uint, event-id: uint }
+  {
+    event-type: (string-ascii 30),
+    co2-amount: uint,
+    distance-km: uint,
+    energy-kwh: uint,
+    recorded-by: principal,
+    timestamp: uint,
+    notes: (string-ascii 150)
+  }
+)
+
+(define-map CarbonOffsets
+  { batch-id: uint, offset-id: uint }
+  {
+    offset-type: (string-ascii 30),
+    co2-offset: uint,
+    verification-authority: (string-ascii 50),
+    offset-date: uint,
+    cost-per-ton: uint,
+    verified: bool
+  }
+)
+
+(define-data-var last-carbon-event-id uint u0)
+(define-data-var last-offset-id uint u0)
+
+(define-constant err-invalid-emissions (err u500))
+(define-constant err-footprint-not-found (err u501))
+(define-constant err-insufficient-offset (err u502))
+
+(define-public (initialize-carbon-tracking (batch-id uint))
+  (begin
+    (asserts! (is-eq tx-sender (unwrap! (nft-get-owner? farm-batch batch-id) err-not-found)) err-owner-only)
+    (asserts! (is-some (map-get? BatchDetails { batch-id: batch-id })) err-batch-not-found)
+    (map-set CarbonFootprint
+      { batch-id: batch-id }
+      {
+        total-emissions: u0,
+        transportation-co2: u0,
+        energy-usage-co2: u0,
+        water-usage-liters: u0,
+        fertilizer-co2: u0,
+        sustainability-score: u0,
+        carbon-neutral: false,
+        last-updated: stacks-block-height,
+        calculated-by: tx-sender
+      }
+    )
+    (ok true)))
+
+(define-public (record-carbon-event (batch-id uint)
+                                  (event-type (string-ascii 30))
+                                  (co2-amount uint)
+                                  (distance-km uint)
+                                  (energy-kwh uint)
+                                  (notes (string-ascii 150)))
+  (let ((new-event-id (+ (var-get last-carbon-event-id) u1))
+        (current-footprint (unwrap! (map-get? CarbonFootprint { batch-id: batch-id }) err-footprint-not-found)))
+    (asserts! (is-eq tx-sender (unwrap! (nft-get-owner? farm-batch batch-id) err-not-found)) err-owner-only)
+    (map-set CarbonEvents
+      { batch-id: batch-id, event-id: new-event-id }
+      {
+        event-type: event-type,
+        co2-amount: co2-amount,
+        distance-km: distance-km,
+        energy-kwh: energy-kwh,
+        recorded-by: tx-sender,
+        timestamp: stacks-block-height,
+        notes: notes
+      }
+    )
+    (let ((updated-total (+ (get total-emissions current-footprint) co2-amount))
+          (updated-transport (if (is-eq event-type "transport") 
+                               (+ (get transportation-co2 current-footprint) co2-amount)
+                               (get transportation-co2 current-footprint)))
+          (updated-energy (if (is-eq event-type "energy")
+                            (+ (get energy-usage-co2 current-footprint) co2-amount)
+                            (get energy-usage-co2 current-footprint)))
+          (updated-fertilizer (if (is-eq event-type "fertilizer")
+                                (+ (get fertilizer-co2 current-footprint) co2-amount)
+                                (get fertilizer-co2 current-footprint))))
+      (map-set CarbonFootprint
+        { batch-id: batch-id }
+        (merge current-footprint
+          {
+            total-emissions: updated-total,
+            transportation-co2: updated-transport,
+            energy-usage-co2: updated-energy,
+            fertilizer-co2: updated-fertilizer,
+            sustainability-score: (calculate-sustainability-score updated-total),
+            last-updated: stacks-block-height
+          }
+        )
+      ))
+    (var-set last-carbon-event-id new-event-id)
+    (ok new-event-id)))
+
+(define-public (purchase-carbon-offset (batch-id uint)
+                                     (offset-type (string-ascii 30))
+                                     (co2-offset uint)
+                                     (verification-authority (string-ascii 50))
+                                     (cost-per-ton uint))
+  (let ((new-offset-id (+ (var-get last-offset-id) u1))
+        (current-footprint (unwrap! (map-get? CarbonFootprint { batch-id: batch-id }) err-footprint-not-found)))
+    (asserts! (is-eq tx-sender (unwrap! (nft-get-owner? farm-batch batch-id) err-not-found)) err-owner-only)
+    (asserts! (> co2-offset u0) err-invalid-emissions)
+    (map-set CarbonOffsets
+      { batch-id: batch-id, offset-id: new-offset-id }
+      {
+        offset-type: offset-type,
+        co2-offset: co2-offset,
+        verification-authority: verification-authority,
+        offset-date: stacks-block-height,
+        cost-per-ton: cost-per-ton,
+        verified: false
+      }
+    )
+    (let ((total-emissions (get total-emissions current-footprint))
+          (is-now-neutral (>= co2-offset total-emissions)))
+      (map-set CarbonFootprint
+        { batch-id: batch-id }
+        (merge current-footprint
+          {
+            carbon-neutral: is-now-neutral,
+            sustainability-score: (if is-now-neutral u100 (get sustainability-score current-footprint)),
+            last-updated: stacks-block-height
+          }
+        )
+      ))
+    (var-set last-offset-id new-offset-id)
+    (ok new-offset-id)))
+
+(define-public (verify-carbon-offset (batch-id uint) (offset-id uint))
+  (let ((offset-info (unwrap! (map-get? CarbonOffsets { batch-id: batch-id, offset-id: offset-id }) err-not-found)))
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (map-set CarbonOffsets
+      { batch-id: batch-id, offset-id: offset-id }
+      (merge offset-info { verified: true })
+    )
+    (ok true)))
+
+(define-private (calculate-sustainability-score (total-emissions uint))
+  (if (<= total-emissions u1000) u90
+    (if (<= total-emissions u2500) u75
+      (if (<= total-emissions u5000) u60
+        (if (<= total-emissions u10000) u45
+          (if (<= total-emissions u20000) u30
+            u15))))))
+
+(define-read-only (get-carbon-footprint (batch-id uint))
+  (ok (map-get? CarbonFootprint { batch-id: batch-id })))
+
+(define-read-only (get-carbon-event (batch-id uint) (event-id uint))
+  (ok (map-get? CarbonEvents { batch-id: batch-id, event-id: event-id })))
+
+(define-read-only (get-carbon-offset (batch-id uint) (offset-id uint))
+  (ok (map-get? CarbonOffsets { batch-id: batch-id, offset-id: offset-id })))
+
+(define-read-only (is-carbon-neutral (batch-id uint))
+  (match (map-get? CarbonFootprint { batch-id: batch-id })
+    footprint-data (ok (get carbon-neutral footprint-data))
+    (ok false)))
+
+(define-read-only (get-sustainability-rating (batch-id uint))
+  (match (map-get? CarbonFootprint { batch-id: batch-id })
+    footprint-data
+    (let ((score (get sustainability-score footprint-data)))
+      (ok (if (>= score u90) "A+"
+            (if (>= score u75) "A"
+              (if (>= score u60) "B"
+                (if (>= score u45) "C"
+                  "D"))))))
+    err-footprint-not-found))
+
 (define-map BatchCertifications
   { batch-id: uint, certification-id: uint }
   {
@@ -548,3 +739,307 @@
   (match (map-get? AuthorizedCertifiers { certifier: certifier })
     certifier-data (ok (get active certifier-data))
     (ok false)))
+
+;; === SUPPLY CHAIN AUDIT TRAIL SYSTEM ===
+;; Independent feature for comprehensive audit tracking and analytics
+
+(define-map AuditTrails
+  { batch-id: uint, audit-id: uint }
+  {
+    audit-type: (string-ascii 40),
+    auditor: principal,
+    audit-scope: (string-ascii 50),
+    compliance-score: uint,
+    findings-count: uint,
+    critical-issues: uint,
+    recommendations: (string-ascii 300),
+    audit-date: uint,
+    completion-date: uint,
+    audit-status: (string-ascii 20),
+    verification-hash: (string-ascii 64)
+  }
+)
+
+(define-map AuditFindings
+  { batch-id: uint, audit-id: uint, finding-id: uint }
+  {
+    severity-level: (string-ascii 10),
+    category: (string-ascii 30),
+    description: (string-ascii 200),
+    location: (string-ascii 50),
+    detected-at: uint,
+    resolved: bool,
+    resolution-date: (optional uint),
+    corrective-action: (string-ascii 150)
+  }
+)
+
+(define-map BatchAnalytics
+  { batch-id: uint }
+  {
+    total-audits: uint,
+    avg-compliance-score: uint,
+    last-audit-date: uint,
+    risk-level: (string-ascii 10),
+    chain-integrity-score: uint,
+    data-completeness: uint,
+    traceability-index: uint,
+    overall-health: (string-ascii 15)
+  }
+)
+
+(define-map AuditMetrics
+  { metric-id: uint }
+  {
+    total-batches-audited: uint,
+    avg-global-compliance: uint,
+    high-risk-batches: uint,
+    audit-frequency: uint,
+    improvement-trend: int,
+    last-calculated: uint
+  }
+)
+
+(define-data-var last-audit-id uint u0)
+(define-data-var last-finding-id uint u0)
+(define-data-var global-metric-id uint u1)
+
+(define-constant err-audit-not-found (err u600))
+(define-constant err-invalid-audit-data (err u601))
+(define-constant err-audit-in-progress (err u602))
+(define-constant err-insufficient-permissions (err u603))
+(define-constant err-invalid-compliance-score (err u604))
+
+(define-public (initiate-audit (batch-id uint)
+                             (audit-type (string-ascii 40))
+                             (audit-scope (string-ascii 50))
+                             (verification-hash (string-ascii 64)))
+  (let ((new-audit-id (+ (var-get last-audit-id) u1)))
+    (asserts! (is-some (map-get? BatchDetails { batch-id: batch-id })) err-batch-not-found)
+    (asserts! (> (len audit-type) u0) err-invalid-audit-data)
+    (map-set AuditTrails
+      { batch-id: batch-id, audit-id: new-audit-id }
+      {
+        audit-type: audit-type,
+        auditor: tx-sender,
+        audit-scope: audit-scope,
+        compliance-score: u0,
+        findings-count: u0,
+        critical-issues: u0,
+        recommendations: "",
+        audit-date: stacks-block-height,
+        completion-date: u0,
+        audit-status: "in-progress",
+        verification-hash: verification-hash
+      }
+    )
+    (var-set last-audit-id new-audit-id)
+    (ok new-audit-id)))
+
+(define-public (add-audit-finding (batch-id uint)
+                                (audit-id uint)
+                                (severity-level (string-ascii 10))
+                                (category (string-ascii 30))
+                                (description (string-ascii 200))
+                                (location (string-ascii 50))
+                                (corrective-action (string-ascii 150)))
+  (let ((new-finding-id (+ (var-get last-finding-id) u1))
+        (audit-info (unwrap! (map-get? AuditTrails { batch-id: batch-id, audit-id: audit-id }) err-audit-not-found)))
+    (asserts! (is-eq tx-sender (get auditor audit-info)) err-insufficient-permissions)
+    (asserts! (is-eq (get audit-status audit-info) "in-progress") err-audit-in-progress)
+    (map-set AuditFindings
+      { batch-id: batch-id, audit-id: audit-id, finding-id: new-finding-id }
+      {
+        severity-level: severity-level,
+        category: category,
+        description: description,
+        location: location,
+        detected-at: stacks-block-height,
+        resolved: false,
+        resolution-date: none,
+        corrective-action: corrective-action
+      }
+    )
+    ;; Update audit trail with new finding count
+    (let ((updated-findings (+ (get findings-count audit-info) u1))
+          (updated-critical (if (is-eq severity-level "critical")
+                              (+ (get critical-issues audit-info) u1)
+                              (get critical-issues audit-info))))
+      (map-set AuditTrails
+        { batch-id: batch-id, audit-id: audit-id }
+        (merge audit-info
+          { findings-count: updated-findings, critical-issues: updated-critical })
+      ))
+    (var-set last-finding-id new-finding-id)
+    (ok new-finding-id)))
+
+(define-public (complete-audit (batch-id uint)
+                             (audit-id uint)
+                             (compliance-score uint)
+                             (recommendations (string-ascii 300)))
+  (let ((audit-info (unwrap! (map-get? AuditTrails { batch-id: batch-id, audit-id: audit-id }) err-audit-not-found)))
+    (asserts! (is-eq tx-sender (get auditor audit-info)) err-insufficient-permissions)
+    (asserts! (is-eq (get audit-status audit-info) "in-progress") err-audit-in-progress)
+    (asserts! (<= compliance-score u100) err-invalid-compliance-score)
+    (map-set AuditTrails
+      { batch-id: batch-id, audit-id: audit-id }
+      (merge audit-info
+        {
+          compliance-score: compliance-score,
+          recommendations: recommendations,
+          completion-date: stacks-block-height,
+          audit-status: "completed"
+        }
+      )
+    )
+    ;; Update batch analytics
+    (try! (update-batch-analytics batch-id))
+    (ok true)))
+
+(define-public (resolve-finding (batch-id uint)
+                              (audit-id uint)
+                              (finding-id uint)
+                              (corrective-action (string-ascii 150)))
+  (let ((finding-info (unwrap! (map-get? AuditFindings { batch-id: batch-id, audit-id: audit-id, finding-id: finding-id }) err-not-found)))
+    (asserts! (is-eq tx-sender (unwrap! (nft-get-owner? farm-batch batch-id) err-not-found)) err-owner-only)
+    (map-set AuditFindings
+      { batch-id: batch-id, audit-id: audit-id, finding-id: finding-id }
+      (merge finding-info
+        {
+          resolved: true,
+          resolution-date: (some stacks-block-height),
+          corrective-action: corrective-action
+        }
+      )
+    )
+    (ok true)))
+
+(define-private (update-batch-analytics (batch-id uint))
+  (match (get-latest-audit-for-batch batch-id)
+    latest-audit
+    (let ((current-analytics (default-to
+                              { total-audits: u0, avg-compliance-score: u0, last-audit-date: u0,
+                                risk-level: "unknown", chain-integrity-score: u0, data-completeness: u0,
+                                traceability-index: u0, overall-health: "unknown" }
+                              (map-get? BatchAnalytics { batch-id: batch-id })))
+          (audit-count (+ (get total-audits current-analytics) u1))
+          (new-avg-score (calculate-average-compliance batch-id audit-count))
+          (risk-level (calculate-risk-level new-avg-score (get critical-issues latest-audit)))
+          (integrity-score (calculate-chain-integrity batch-id))
+          (completeness (calculate-data-completeness batch-id))
+          (traceability (calculate-traceability-index batch-id))
+          (health-status (determine-overall-health new-avg-score risk-level)))
+      (map-set BatchAnalytics
+        { batch-id: batch-id }
+        {
+          total-audits: audit-count,
+          avg-compliance-score: new-avg-score,
+          last-audit-date: stacks-block-height,
+          risk-level: risk-level,
+          chain-integrity-score: integrity-score,
+          data-completeness: completeness,
+          traceability-index: traceability,
+          overall-health: health-status
+        }
+      )
+      (ok true))
+    (err u0)))
+
+(define-private (get-latest-audit-for-batch (batch-id uint))
+  (let ((current-audit-id (var-get last-audit-id)))
+    (map-get? AuditTrails { batch-id: batch-id, audit-id: current-audit-id })))
+
+(define-private (calculate-average-compliance (batch-id uint) (audit-count uint))
+  (if (is-eq audit-count u1)
+    (match (get-latest-audit-for-batch batch-id)
+      latest-audit (get compliance-score latest-audit)
+      u0)
+    (let ((current-avg (get avg-compliance-score (default-to { avg-compliance-score: u0 } (map-get? BatchAnalytics { batch-id: batch-id }))))
+          (new-score (match (get-latest-audit-for-batch batch-id)
+                       latest-audit (get compliance-score latest-audit)
+                       u0)))
+      (/ (+ (* current-avg (- audit-count u1)) new-score) audit-count))))
+
+(define-private (calculate-risk-level (compliance-score uint) (critical-issues uint))
+  (if (and (>= compliance-score u90) (is-eq critical-issues u0)) "low"
+    (if (and (>= compliance-score u70) (<= critical-issues u2)) "medium"
+      "high")))
+
+(define-private (calculate-chain-integrity (batch-id uint))
+  (let ((batch-details (map-get? BatchDetails { batch-id: batch-id }))
+        (stage-count (if (is-some batch-details) u1 u0))
+        (inspection-count (if (is-some (map-get? QualityInspections { batch-id: batch-id, inspection-id: u1 })) u1 u0))
+        (temp-readings (if (is-some (map-get? TemperatureReadings { batch-id: batch-id, reading-id: u1 })) u1 u0)))
+    (+ (* stage-count u30) (* inspection-count u35) (* temp-readings u35))))
+
+(define-private (calculate-data-completeness (batch-id uint))
+  (let ((has-batch (if (is-some (map-get? BatchDetails { batch-id: batch-id })) u20 u0))
+        (has-expiration (if (is-some (map-get? BatchExpiration { batch-id: batch-id })) u20 u0))
+        (has-carbon (if (is-some (map-get? CarbonFootprint { batch-id: batch-id })) u20 u0))
+        (has-certification (if (is-some (map-get? BatchCertifications { batch-id: batch-id, certification-id: u1 })) u20 u0))
+        (has-inspection (if (is-some (map-get? QualityInspections { batch-id: batch-id, inspection-id: u1 })) u20 u0)))
+    (+ has-batch has-expiration has-carbon has-certification has-inspection)))
+
+(define-private (calculate-traceability-index (batch-id uint))
+  (let ((integrity (calculate-chain-integrity batch-id))
+        (completeness (calculate-data-completeness batch-id)))
+    (/ (+ integrity completeness) u2)))
+
+(define-private (determine-overall-health (compliance uint) (risk-level (string-ascii 10)))
+  (if (and (>= compliance u85) (is-eq risk-level "low")) "excellent"
+    (if (and (>= compliance u70) (not (is-eq risk-level "high"))) "good"
+      (if (>= compliance u50) "fair"
+        "poor"))))
+
+;; Read-only functions for audit trail access
+
+(define-read-only (get-audit-details (batch-id uint) (audit-id uint))
+  (ok (map-get? AuditTrails { batch-id: batch-id, audit-id: audit-id })))
+
+(define-read-only (get-audit-finding (batch-id uint) (audit-id uint) (finding-id uint))
+  (ok (map-get? AuditFindings { batch-id: batch-id, audit-id: audit-id, finding-id: finding-id })))
+
+(define-read-only (get-batch-analytics (batch-id uint))
+  (ok (map-get? BatchAnalytics { batch-id: batch-id })))
+
+(define-read-only (get-compliance-summary (batch-id uint))
+  (match (map-get? BatchAnalytics { batch-id: batch-id })
+    analytics
+    (ok {
+      batch-id: batch-id,
+      compliance-score: (get avg-compliance-score analytics),
+      risk-level: (get risk-level analytics),
+      health-status: (get overall-health analytics),
+      last-audited: (get last-audit-date analytics),
+      audit-count: (get total-audits analytics)
+    })
+    err-audit-not-found))
+
+(define-read-only (get-audit-history-summary (batch-id uint))
+  (let ((analytics (map-get? BatchAnalytics { batch-id: batch-id })))
+    (if (is-some analytics)
+      (ok {
+        total-audits: (get total-audits (unwrap-panic analytics)),
+        avg-compliance: (get avg-compliance-score (unwrap-panic analytics)),
+        integrity-score: (get chain-integrity-score (unwrap-panic analytics)),
+        traceability-index: (get traceability-index (unwrap-panic analytics)),
+        data-completeness: (get data-completeness (unwrap-panic analytics))
+      })
+      (ok {
+        total-audits: u0,
+        avg-compliance: u0,
+        integrity-score: u0,
+        traceability-index: u0,
+        data-completeness: u0
+      }))))
+
+(define-read-only (is-batch-audit-compliant (batch-id uint) (min-score uint))
+  (match (map-get? BatchAnalytics { batch-id: batch-id })
+    analytics (ok (>= (get avg-compliance-score analytics) min-score))
+    (ok false)))
+
+(define-read-only (get-current-audit-metrics)
+  (ok (default-to
+        { total-batches-audited: u0, avg-global-compliance: u0, high-risk-batches: u0,
+          audit-frequency: u0, improvement-trend: 0, last-calculated: u0 }
+        (map-get? AuditMetrics { metric-id: (var-get global-metric-id) }))))
