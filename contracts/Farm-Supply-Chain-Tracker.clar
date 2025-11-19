@@ -1043,3 +1043,237 @@
         { total-batches-audited: u0, avg-global-compliance: u0, high-risk-batches: u0,
           audit-frequency: u0, improvement-trend: 0, last-calculated: u0 }
         (map-get? AuditMetrics { metric-id: (var-get global-metric-id) }))))
+
+;; === BATCH REPUTATION & TRUST SCORING SYSTEM ===
+;; Independent feature for tracking batch performance and reliability metrics
+
+(define-map BatchReputation
+  { batch-id: uint }
+  {
+    reputation-score: uint,
+    quality-incidents: uint,
+    passed-inspections: uint,
+    failed-inspections: uint,
+    compliance-violations: uint,
+    on-time-delivery-count: uint,
+    late-delivery-count: uint,
+    recalls-initiated: uint,
+    trust-rating: (string-ascii 10),
+    last-reputation-update: uint,
+    reputation-calculated-by: principal
+  }
+)
+
+(define-map ReputationAdjustments
+  { batch-id: uint, adjustment-id: uint }
+  {
+    adjustment-type: (string-ascii 30),
+    score-change: int,
+    reason: (string-ascii 150),
+    adjusted-by: principal,
+    adjustment-timestamp: uint
+  }
+)
+
+(define-data-var last-adjustment-id uint u0)
+
+(define-constant err-reputation-not-found (err u700))
+(define-constant err-invalid-adjustment (err u701))
+(define-constant err-batch-reputation-exists (err u702))
+
+(define-public (initialize-batch-reputation (batch-id uint))
+  (begin
+    (asserts! (is-eq tx-sender (unwrap! (nft-get-owner? farm-batch batch-id) err-not-found)) err-owner-only)
+    (asserts! (is-none (map-get? BatchReputation { batch-id: batch-id })) err-batch-reputation-exists)
+    (map-set BatchReputation
+      { batch-id: batch-id }
+      {
+        reputation-score: u80,
+        quality-incidents: u0,
+        passed-inspections: u0,
+        failed-inspections: u0,
+        compliance-violations: u0,
+        on-time-delivery-count: u0,
+        late-delivery-count: u0,
+        recalls-initiated: u0,
+        trust-rating: "good",
+        last-reputation-update: stacks-block-height,
+        reputation-calculated-by: tx-sender
+      }
+    )
+    (ok true)))
+
+(define-public (record-inspection-result (batch-id uint) (passed-inspection bool))
+  (let ((reputation (unwrap! (map-get? BatchReputation { batch-id: batch-id }) err-reputation-not-found)))
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (let ((updated-passed (if passed-inspection (+ (get passed-inspections reputation) u1) (get passed-inspections reputation)))
+          (updated-failed (if passed-inspection (get failed-inspections reputation) (+ (get failed-inspections reputation) u1)))
+          (new-score (calculate-reputation-score 
+                       updated-passed 
+                       updated-failed 
+                       (get compliance-violations reputation) 
+                       (get quality-incidents reputation)
+                       (get on-time-delivery-count reputation)
+                       (get late-delivery-count reputation)
+                       (get recalls-initiated reputation)))
+          (new-trust-rating (determine-trust-rating new-score)))
+      (map-set BatchReputation
+        { batch-id: batch-id }
+        (merge reputation
+          {
+            reputation-score: new-score,
+            passed-inspections: updated-passed,
+            failed-inspections: updated-failed,
+            trust-rating: new-trust-rating,
+            last-reputation-update: stacks-block-height
+          }
+        )
+      )
+      (ok new-score))))
+
+(define-public (log-compliance-violation (batch-id uint) (violation-description (string-ascii 150)))
+  (let ((reputation (unwrap! (map-get? BatchReputation { batch-id: batch-id }) err-reputation-not-found)))
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (let ((updated-violations (+ (get compliance-violations reputation) u1))
+          (new-score (calculate-reputation-score 
+                       (get passed-inspections reputation) 
+                       (get failed-inspections reputation) 
+                       updated-violations 
+                       (get quality-incidents reputation)
+                       (get on-time-delivery-count reputation)
+                       (get late-delivery-count reputation)
+                       (get recalls-initiated reputation)))
+          (new-trust-rating (determine-trust-rating new-score)))
+      (map-set BatchReputation
+        { batch-id: batch-id }
+        (merge reputation
+          {
+            reputation-score: new-score,
+            compliance-violations: updated-violations,
+            trust-rating: new-trust-rating,
+            last-reputation-update: stacks-block-height
+          }
+        )
+      )
+      (let ((new-adjustment-id (+ (var-get last-adjustment-id) u1)))
+        (map-set ReputationAdjustments
+          { batch-id: batch-id, adjustment-id: new-adjustment-id }
+          {
+            adjustment-type: "compliance-violation",
+            score-change: -10,
+            reason: violation-description,
+            adjusted-by: tx-sender,
+            adjustment-timestamp: stacks-block-height
+          }
+        )
+        (var-set last-adjustment-id new-adjustment-id)
+        (ok new-score)))))
+
+(define-public (record-delivery-status (batch-id uint) (on-time bool))
+  (let ((reputation (unwrap! (map-get? BatchReputation { batch-id: batch-id }) err-reputation-not-found)))
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (let ((updated-on-time (if on-time (+ (get on-time-delivery-count reputation) u1) (get on-time-delivery-count reputation)))
+          (updated-late (if on-time (get late-delivery-count reputation) (+ (get late-delivery-count reputation) u1)))
+          (new-score (calculate-reputation-score 
+                       (get passed-inspections reputation) 
+                       (get failed-inspections reputation) 
+                       (get compliance-violations reputation) 
+                       (get quality-incidents reputation)
+                       updated-on-time
+                       updated-late
+                       (get recalls-initiated reputation)))
+          (new-trust-rating (determine-trust-rating new-score)))
+      (map-set BatchReputation
+        { batch-id: batch-id }
+        (merge reputation
+          {
+            reputation-score: new-score,
+            on-time-delivery-count: updated-on-time,
+            late-delivery-count: updated-late,
+            trust-rating: new-trust-rating,
+            last-reputation-update: stacks-block-height
+          }
+        )
+      )
+      (ok new-score))))
+
+(define-public (record-recall-incident (batch-id uint) (recall-reason (string-ascii 150)))
+  (let ((reputation (unwrap! (map-get? BatchReputation { batch-id: batch-id }) err-reputation-not-found)))
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (let ((updated-recalls (+ (get recalls-initiated reputation) u1))
+          (updated-incidents (+ (get quality-incidents reputation) u1))
+          (new-score (calculate-reputation-score 
+                       (get passed-inspections reputation) 
+                       (get failed-inspections reputation) 
+                       (get compliance-violations reputation) 
+                       updated-incidents
+                       (get on-time-delivery-count reputation)
+                       (get late-delivery-count reputation)
+                       updated-recalls))
+          (new-trust-rating (determine-trust-rating new-score)))
+      (map-set BatchReputation
+        { batch-id: batch-id }
+        (merge reputation
+          {
+            reputation-score: new-score,
+            quality-incidents: updated-incidents,
+            recalls-initiated: updated-recalls,
+            trust-rating: new-trust-rating,
+            last-reputation-update: stacks-block-height
+          }
+        )
+      )
+      (let ((new-adjustment-id (+ (var-get last-adjustment-id) u1)))
+        (map-set ReputationAdjustments
+          { batch-id: batch-id, adjustment-id: new-adjustment-id }
+          {
+            adjustment-type: "recall-incident",
+            score-change: -20,
+            reason: recall-reason,
+            adjusted-by: tx-sender,
+            adjustment-timestamp: stacks-block-height
+          }
+        )
+        (var-set last-adjustment-id new-adjustment-id)
+        (ok new-score)))))
+
+(define-private (calculate-reputation-score (passed-inspections uint) (failed-inspections uint) (compliance-violations uint) (quality-incidents uint) (on-time-count uint) (late-count uint) (recalls uint))
+  (let ((total-inspections (+ passed-inspections failed-inspections))
+        (inspection-factor (if (is-eq total-inspections u0) u0 (/ (* passed-inspections u25) total-inspections)))
+        (delivery-factor (if (is-eq (+ on-time-count late-count) u0) u0 (/ (* on-time-count u25) (+ on-time-count late-count))))
+        (compliance-factor (if (> compliance-violations u0) (if (> compliance-violations u2) u10 u15) u25))
+        (quality-factor (if (> quality-incidents u0) (if (> quality-incidents u1) u10 u20) u25))
+        (recall-penalty (* recalls u5)))
+    (let ((base-score (+ inspection-factor delivery-factor compliance-factor quality-factor))
+          (final-score (if (>= base-score recall-penalty) (- base-score recall-penalty) u0)))
+      (if (> final-score u100) u100 final-score))))
+
+(define-private (determine-trust-rating (reputation-score uint))
+  (if (>= reputation-score u90) "excellent"
+    (if (>= reputation-score u75) "good"
+      (if (>= reputation-score u60) "fair"
+        (if (>= reputation-score u40) "poor"
+          "unreliable")))))
+
+(define-read-only (get-batch-reputation (batch-id uint))
+  (ok (map-get? BatchReputation { batch-id: batch-id })))
+
+(define-read-only (get-reputation-adjustment (batch-id uint) (adjustment-id uint))
+  (ok (map-get? ReputationAdjustments { batch-id: batch-id, adjustment-id: adjustment-id })))
+
+(define-read-only (get-trust-rating (batch-id uint))
+  (match (map-get? BatchReputation { batch-id: batch-id })
+    reputation-data
+    (ok {
+      batch-id: batch-id,
+      trust-rating: (get trust-rating reputation-data),
+      reputation-score: (get reputation-score reputation-data),
+      quality-incidents: (get quality-incidents reputation-data),
+      compliance-violations: (get compliance-violations reputation-data)
+    })
+    err-reputation-not-found))
+
+(define-read-only (is-batch-trustworthy (batch-id uint) (min-rating-threshold uint))
+  (match (map-get? BatchReputation { batch-id: batch-id })
+    reputation-data (ok (>= (get reputation-score reputation-data) min-rating-threshold))
+    (ok false)))
